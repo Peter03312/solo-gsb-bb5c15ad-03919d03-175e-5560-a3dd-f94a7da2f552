@@ -9,6 +9,9 @@
  *  - 任一时刻任何瓶的余量不得为负（按 操作时间 + 入库顺序 重放全量台账校验）。
  *  - 更正历史操作的取用量时，在事务内重算；若导致后续操作超用，整次更正回滚，
  *    原数据保持不变，并返回冲突记录。
+ *  - 更正支持两阶段：预演（不写库）给出余量变化与目标瓶及下游瓶的原瓶贡献前后对照，
+ *    并签发绑定 更正计划 + 台账版本 的确认凭据；确认在单事务中核对凭据并原子应用，
+ *    结果与预演一致；同一凭据重试幂等返回首次结果，不重复更正。
  *  - better-sqlite3 为同步驱动，所有写操作包裹在事务中串行执行，
  *    并发请求争用同一来源瓶时天然保证体积守恒。
  */
@@ -60,6 +63,13 @@ CREATE TABLE IF NOT EXISTS batch_items (
   idx      INTEGER NOT NULL,                  -- 批内录入顺序（0 起）；同操作时间时按此序核算
   op_id    TEXT NOT NULL UNIQUE REFERENCES operations(op_id),
   PRIMARY KEY (batch_id, idx)
+);
+CREATE TABLE IF NOT EXISTS correction_confirms (
+  token_hash   TEXT PRIMARY KEY,              -- 确认凭据的 SHA-256，用于“同一凭据重试”幂等判定
+  op_id        TEXT NOT NULL,
+  plan_hash    TEXT NOT NULL,                 -- 首次确认的更正计划哈希
+  response     TEXT NOT NULL,                 -- 首次成功响应（JSON），重试时原样返回
+  confirmed_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
@@ -131,6 +141,8 @@ const qInsBatch   = db.prepare('INSERT INTO batches (batch_id, plan_hash, item_c
 const qInsBatchItem = db.prepare('INSERT INTO batch_items (batch_id, idx, op_id) VALUES (?, ?, ?)');
 const qVersion    = db.prepare("SELECT value FROM meta WHERE key = 'ledger_version'");
 const qBumpVersion = db.prepare("UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'ledger_version'");
+const qCorrConfirmGet = db.prepare('SELECT * FROM correction_confirms WHERE token_hash = ?');
+const qCorrConfirmIns = db.prepare('INSERT INTO correction_confirms (token_hash, op_id, plan_hash, response, confirmed_at) VALUES (?, ?, ?, ?, ?)');
 
 /**
  * 台账版本号：任何写操作（登记原瓶 / 单条操作 / 更正 / 批次提交）成功提交后递增。
@@ -629,6 +641,168 @@ function contributionReport(index, bottleRow) {
   };
 }
 
+// ------------------------------------------------- 更正预演 / 确认（两阶段）
+
+/** 更正计划的规范化内容哈希：绑定操作号与拟替换的来源列表（顺序敏感，确认内容须与预演严格一致）。 */
+function correctionPlanHash(opId, sources) {
+  const canonical = JSON.stringify({
+    op_id: opId,
+    sources: sources.map((s) => ({ bottle: s.bottle, volume: s.volume })),
+  });
+  return crypto.createHash('sha256').update(canonical).digest('hex');
+}
+
+/** 更正确认凭据：绑定 更正计划哈希 + 当前台账版本，HMAC 签名防篡改（域前缀 c1 与批次凭据 v1 隔离）。 */
+function signCorrectionToken(version, planHash) {
+  const mac = crypto.createHmac('sha256', TOKEN_SECRET).update(`c1.${version}.${planHash}`).digest('hex');
+  return `c1.${version}.${planHash}.${mac}`;
+}
+
+function verifyCorrectionToken(token, planHash) {
+  if (typeof token !== 'string' || !token) {
+    throw new ApiError(400, 'TOKEN_REQUIRED', '缺少确认凭据 confirm_token：请先调用 POST /api/operations/:op_id/corrections/preview 预演');
+  }
+  const parts = token.split('.');
+  if (parts.length !== 4 || parts[0] !== 'c1') {
+    throw new ApiError(400, 'BAD_TOKEN', '确认凭据格式无效，请重新预演获取');
+  }
+  const [, ver, ph, mac] = parts;
+  const expect = crypto.createHmac('sha256', TOKEN_SECRET).update(`c1.${ver}.${ph}`).digest('hex');
+  const a = Buffer.from(mac); const b = Buffer.from(expect);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    throw new ApiError(409, 'BAD_TOKEN', '确认凭据无效（可能已过期或被篡改），请重新预演');
+  }
+  if (ph !== planHash) {
+    throw new ApiError(409, 'PLAN_CHANGED', '确认内容与预演时的更正计划不一致，请重新预演');
+  }
+  if (parseInt(ver, 10) !== ledgerVersion()) {
+    throw new ApiError(409, 'STALE_TOKEN', '预演后台账已发生变化（有新登记 / 操作 / 更正 / 批次提交），预演结果已失效，请重新预演');
+  }
+}
+
+/** 由形成图（目标瓶 → 来源列表）计算 bottleId 的全部下游瓶（直接或间接以其为来源的衍生瓶，不含自身）。 */
+function downstreamBottles(derivedMap, bottleId) {
+  const consumers = new Map(); // 来源瓶 -> [以其为来源的衍生瓶]
+  for (const [target, spec] of derivedMap) {
+    for (const s of spec.sources) {
+      if (!consumers.has(s.bottle)) consumers.set(s.bottle, []);
+      consumers.get(s.bottle).push(target);
+    }
+  }
+  const seen = new Set([bottleId]);
+  const queue = [bottleId];
+  while (queue.length) {
+    const cur = queue.shift();
+    for (const nxt of consumers.get(cur) || []) {
+      if (!seen.has(nxt)) { seen.add(nxt); queue.push(nxt); }
+    }
+  }
+  seen.delete(bottleId);
+  return [...seen].sort();
+}
+
+/** 贡献报告的可比较签名：形成时总体积 + 各原瓶约分贡献（报告内已按原瓶编号排序）。 */
+function contributionSignature(rep) {
+  return rep.formation_volume + '|' + rep.contributions
+    .map((c) => `${c.bottle}=${c.contribution_ml.numerator}/${c.contribution_ml.denominator}`)
+    .join('|');
+}
+
+/**
+ * 预演更正（不写库）：把操作 opId 的来源替换为 newSources 后，
+ *  - 按 (操作时间, 入库顺序) 重放全账，给出余量发生变化的瓶（before/after）与超用冲突；
+ *  - 在更正前后的形成图上，给出目标瓶及其下游瓶原瓶精确贡献的前后对照（无变化不列出）。
+ * 调用方须先完成来源存在性与时间先后校验。返回 { conflicts, balance_changes, contribution_changes }。
+ */
+function simulateCorrection(opId, newSources) {
+  const { bottles, ops } = loadLedger();
+  const before = replayLedger(bottles, ops).balances;
+  const afterOps = ops.map((o) => (o.op_id === opId
+    ? { ...o, sources: newSources.map((s) => ({ bottle: s.bottle, volume: s.volume })) }
+    : o));
+  const afterReplay = replayLedger(bottles, afterOps);
+  if (afterReplay.conflicts.length) {
+    return { conflicts: afterReplay.conflicts, balance_changes: [], contribution_changes: [] };
+  }
+  const balanceChanges = [];
+  for (const [id, b] of before) {
+    const a = afterReplay.balances.get(id) ?? 0;
+    if (a !== b) balanceChanges.push({ bottle: id, before: b, after: a });
+  }
+  balanceChanges.sort((x, y) => (x.bottle < y.bottle ? -1 : x.bottle > y.bottle ? 1 : 0));
+
+  const { origMap, derivedMap } = loadCompositionMaps();
+  const op = qOp.get(opId);
+  const correctedMap = new Map(derivedMap);
+  correctedMap.set(op.target_bottle, {
+    op_id: opId,
+    sources: newSources.map((s) => ({ bottle: s.bottle, volume: BigInt(s.volume) })),
+  });
+  const idxBefore = buildCompositionIndex(origMap, derivedMap);
+  const idxAfter = buildCompositionIndex(origMap, correctedMap);
+  const rows = new Map(db.prepare('SELECT id, kind, created_op FROM bottles').all().map((b) => [b.id, b]));
+  const affected = [op.target_bottle, ...downstreamBottles(derivedMap, op.target_bottle)];
+  const contributionChanges = [];
+  for (const id of affected) {
+    const bRep = contributionReport(idxBefore, rows.get(id));
+    const aRep = contributionReport(idxAfter, rows.get(id));
+    if (contributionSignature(bRep) !== contributionSignature(aRep)) {
+      contributionChanges.push({
+        bottle: id,
+        before: { formation_volume: bRep.formation_volume, contributions: bRep.contributions, sum_ml: bRep.sum_ml },
+        after: { formation_volume: aRep.formation_volume, contributions: aRep.contributions, sum_ml: aRep.sum_ml },
+      });
+    }
+  }
+  return { conflicts: [], balance_changes: balanceChanges, contribution_changes: contributionChanges };
+}
+
+/**
+ * 更正确认（单事务）：同一凭据已确认 → 幂等返回首次结果；否则
+ * 核对凭据（计划一致 + 台账版本未变）→ 重跑业务校验 → 落库 → 重放全账，
+ * 任一环节失败整体回滚。版本未变即台账与预演时一致，故差异快照与预演结果相同。
+ */
+const confirmCorrection = db.transaction((opId, sources, token) => {
+  const planHash = correctionPlanHash(opId, sources);
+  const tokenKey = crypto.createHash('sha256').update(String(token)).digest('hex');
+  const prior = qCorrConfirmGet.get(tokenKey);
+  if (prior) {
+    if (prior.op_id !== opId || prior.plan_hash !== planHash) {
+      throw new ApiError(409, 'PLAN_CHANGED', '确认内容与该凭据首次确认的更正计划不一致，请重新预演');
+    }
+    return { ...JSON.parse(prior.response), idempotent: true,
+             message: `更正凭据已于 ${prior.confirmed_at} 确认过，幂等返回首次结果，未重复更正` };
+  }
+  verifyCorrectionToken(token, planHash);
+  const op = qOp.get(opId);
+  if (!op) throw new ApiError(404, 'OP_NOT_FOUND', `操作 ${opId} 不存在`);
+  for (const s of sources) {
+    const b = qBottle.get(s.bottle);
+    if (!b) throw new ApiError(400, 'SOURCE_NOT_FOUND', `来源瓶 ${s.bottle} 不存在`);
+    if (op.op_time < b.created_time) {
+      throw new ApiError(400, 'TIME_BEFORE_SOURCE',
+        `操作时间 ${op.op_time} 早于来源瓶 ${s.bottle} 的创建时间 ${b.created_time}`);
+    }
+  }
+  const diff = simulateCorrection(opId, sources); // 落库前计算，与预演结果一致
+  qDelSources.run(opId);
+  for (const s of sources) qInsSource.run(opId, s.bottle, s.volume);
+  const { conflicts } = recompute();
+  if (conflicts.length) {
+    throw new ApiError(409, 'OVERDRAW', '更正将导致以下操作超用，整次更正已拒绝，原数据保持不变', conflicts);
+  }
+  qBumpVersion.run();
+  const response = {
+    ok: true, idempotent: false, op_id: opId,
+    balance_changes: diff.balance_changes,
+    contribution_changes: diff.contribution_changes,
+    ledger_version: ledgerVersion(),
+    message: `操作 ${opId} 的更正已确认并原子应用：${diff.balance_changes.length} 个瓶余量、${diff.contribution_changes.length} 个瓶的原瓶贡献已按预演结果重算`,
+  };
+  qCorrConfirmIns.run(tokenKey, opId, planHash, JSON.stringify(response), new Date().toISOString());
+  return response;
+});
+
 // ---------------------------------------------------------------- HTTP 层
 
 const app = express();
@@ -676,6 +850,84 @@ app.post('/api/operations', wrap((req, res) => {
 app.post('/api/operations/:opId/correct', wrap((req, res) => {
   const sources = parseSources(req.body.sources);
   res.json(correctOperation(req.params.opId, sources));
+}));
+
+/**
+ * 更正预演（不写库）：提交操作号与拟替换的来源瓶、取用毫升数，返回该更正对当前台账的影响
+ * （因重放而变化的瓶余量 + 目标瓶及其下游瓶更正前后的原瓶精确贡献，无变化项不列出）
+ * 与确认凭据。操作号 / 来源不存在、来源重复、体积无效、时间早于来源创建、重放后任一操作
+ * 超用时，返回具体原因及冲突明细，不签发确认凭据。
+ */
+app.post('/api/operations/:opId/corrections/preview', wrap((req, res) => {
+  const opId = req.params.opId;
+  const errors = [];
+  let conflicts = [];
+  const op = qOp.get(opId);
+  if (!op) errors.push({ code: 'OP_NOT_FOUND', message: `操作 ${opId} 不存在` });
+  const sources = [];
+  const rawSrcs = req.body.sources;
+  if (!Array.isArray(rawSrcs) || rawSrcs.length === 0) {
+    errors.push({ code: 'NO_SOURCES', message: '每次操作至少需要一个来源瓶' });
+  } else {
+    const seen = new Set();
+    rawSrcs.forEach((s, i) => {
+      let bottle = null; let volume = null; let bad = false;
+      try { bottle = normId(s && s.bottle, `来源瓶编号（第 ${i + 1} 行）`); } catch (e) { errors.push({ code: e.code, message: e.message }); bad = true; }
+      try { volume = normVolume(s && s.volume, `取用体积（第 ${i + 1} 行）`); } catch (e) { errors.push({ code: e.code, message: e.message }); bad = true; }
+      if (!bad) {
+        if (seen.has(bottle)) errors.push({ code: 'DUP_SOURCE', message: `同一操作内来源瓶 ${bottle} 重复` });
+        else { seen.add(bottle); sources.push({ bottle, volume }); }
+      }
+    });
+  }
+  let diff = { balance_changes: [], contribution_changes: [] };
+  if (op && errors.length === 0) {
+    for (const s of sources) {
+      const b = qBottle.get(s.bottle);
+      if (!b) { errors.push({ code: 'SOURCE_NOT_FOUND', message: `来源瓶 ${s.bottle} 不存在` }); continue; }
+      if (op.op_time < b.created_time) {
+        errors.push({ code: 'TIME_BEFORE_SOURCE',
+          message: `操作时间 ${op.op_time} 早于来源瓶 ${s.bottle} 的创建时间 ${b.created_time}` });
+      }
+    }
+    if (errors.length === 0) {
+      const sim = simulateCorrection(opId, sources);
+      conflicts = sim.conflicts;
+      for (const c of conflicts) {
+        errors.push({ code: 'OVERDRAW',
+          message: `更正将导致操作 ${c.op_id} 从瓶 ${c.bottle} 需取 ${c.requested} mL，该时刻可用仅 ${c.available} mL` });
+      }
+      if (errors.length === 0) {
+        diff = { balance_changes: sim.balance_changes, contribution_changes: sim.contribution_changes };
+      }
+    }
+  }
+  const ok = errors.length === 0;
+  const version = ledgerVersion();
+  res.json({
+    ok,
+    op_id: opId,
+    plan_hash: correctionPlanHash(opId, sources),
+    ledger_version: version,
+    errors,
+    conflicts,
+    balance_changes: diff.balance_changes,
+    contribution_changes: diff.contribution_changes,
+    confirm_token: ok ? signCorrectionToken(version, correctionPlanHash(opId, sources)) : null,
+    message: ok
+      ? `预演通过：更正 ${opId} 将变化 ${diff.balance_changes.length} 个瓶余量、${diff.contribution_changes.length} 个瓶的原瓶贡献；凭据已绑定当前台账（版本 ${version}），确认前若台账变化需重新预演`
+      : '预演未通过：请修正下列问题后重新预演（未写入任何数据，未签发确认凭据）',
+  });
+}));
+
+/**
+ * 更正确认（单事务，原子应用或整体回滚）：确认内容须与预演完全相同且台账版本未变，
+ * 成功时应用结果与预演一致；同一凭据重试 → 200 幂等返回首次结果，不重复更正。
+ */
+app.post('/api/operations/:opId/corrections/confirm', wrap((req, res) => {
+  const sources = parseSources(req.body.sources);
+  const result = confirmCorrection(req.params.opId, sources, req.body.confirm_token);
+  res.status(result.idempotent ? 200 : 201).json(result);
 }));
 
 app.get('/api/bottles', wrap((req, res) => {

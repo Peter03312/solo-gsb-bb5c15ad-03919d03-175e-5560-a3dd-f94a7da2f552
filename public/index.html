@@ -55,7 +55,7 @@ h4{margin:14px 0 6px;font-size:14px}
 <body>
 <header>
   <h1>水质实验室 · 样本分装与混样溯源工作台</h1>
-  <p>原瓶登记 / 分装混样 / 批次预演与提交 / 余量守恒 / 谱系溯源 / 历史更正（冲突自动回滚）</p>
+  <p>原瓶登记 / 分装混样 / 批次预演与提交 / 余量守恒 / 谱系溯源 / 历史更正（预演 + 确认两阶段，冲突自动回滚）</p>
 </header>
 <nav>
   <button data-tab="bottles" class="active">瓶子总览</button>
@@ -143,13 +143,18 @@ h4{margin:14px 0 6px;font-size:14px}
   </div>
   <div class="card" id="correctCard" style="display:none">
     <h3>更正操作取用量：<span id="corr_op" class="mono"></span></h3>
-    <p class="hint">仅可修改来源瓶与取用量；提交后按操作顺序重算相关瓶余量。若导致后续操作超用，整次更正拒绝并回滚，原数据保持不变。</p>
+    <p class="hint">仅可修改来源瓶与取用量。推荐先“预演更正”查看影响（因重放而变化的瓶余量、目标瓶及下游瓶
+      更正前后的原瓶精确贡献，不写库），再“确认更正”原子应用（结果与预演一致；预演后若有新登记 / 操作 /
+      更正 / 批次提交，需重新预演）。也可沿用“立即更正”直接提交；若导致后续操作超用，整次更正拒绝并回滚。</p>
     <div id="corrSources"></div>
     <p>
       <button class="btn secondary small" id="corrAddRow">+ 添加来源行</button>
-      <button class="btn" id="corrSubmit">提交更正</button>
+      <button class="btn" id="corrPreview">预演更正</button>
+      <button class="btn" id="corrConfirm" style="display:none">确认更正</button>
+      <button class="btn secondary" id="corrSubmit">立即更正</button>
       <button class="btn secondary" id="corrCancel">取消</button>
     </p>
+    <div id="corrPreviewResult"></div>
   </div>
 </section>
 </main>
@@ -382,6 +387,9 @@ function openCorrect(o) {
   const box = $('corrSources');
   box.innerHTML = '';
   for (const s of o.sources) addSourceRow(box, s.bottle, s.volume);
+  corrPreviewState = null;
+  $('corrConfirm').style.display = 'none';
+  $('corrPreviewResult').innerHTML = '';
   $('correctCard').style.display = '';
   $('correctCard').scrollIntoView({ behavior: 'smooth' });
   $('corrSubmit').onclick = async () => {
@@ -403,6 +411,106 @@ function openCorrect(o) {
 }
 
 $('corrCancel').addEventListener('click', () => { $('correctCard').style.display = 'none'; clearMsg(); });
+
+// ---------- 更正预演 / 确认（两阶段） ----------
+let corrPreviewState = null; // { opId, sourcesJson, token }：确认内容必须与预演计划一致
+
+function renderContributionChange(cc) {
+  const beforeMap = new Map(cc.before.contributions.map(c => [c.bottle, c.contribution_ml]));
+  const afterMap = new Map(cc.after.contributions.map(c => [c.bottle, c.contribution_ml]));
+  const ids = [...new Set([...beforeMap.keys(), ...afterMap.keys()])].sort();
+  let html = `<p class="mono" style="margin-bottom:2px">${escapeHtml(cc.bottle)}` +
+    `<span class="hint">（形成时总体积 ${cc.before.formation_volume} → ${cc.after.formation_volume} mL）</span></p>`;
+  html += '<table><thead><tr><th>原始瓶编号</th><th class="num">更正前贡献 (mL)</th><th class="num">更正后贡献 (mL)</th></tr></thead><tbody>';
+  for (const id of ids) {
+    html += `<tr><td class="mono">${escapeHtml(id)}</td>` +
+      `<td class="num mono">${fmtFrac(beforeMap.get(id))}</td>` +
+      `<td class="num mono">${fmtFrac(afterMap.get(id))}</td></tr>`;
+  }
+  return html + '</tbody></table>';
+}
+
+function renderCorrPreview(r) {
+  const el = $('corrPreviewResult');
+  let html = `<h4>预演结果：${r.ok
+    ? '<span class="ok-text">✓ 通过，可确认</span>'
+    : '<span class="low">✗ 未通过（未写入任何数据）</span>'}</h4>`;
+  html += `<p class="hint">${escapeHtml(r.message)}</p>`;
+  if (r.errors && r.errors.length) {
+    html += '<p class="low">' + r.errors.map(e => escapeHtml(e.message)).join('<br>') + '</p>';
+  }
+  if (r.ok) {
+    if (r.balance_changes && r.balance_changes.length) {
+      html += '<h4>瓶余量变化（按 操作时间 + 入库顺序 重放）</h4>' +
+        '<table><thead><tr><th>瓶编号</th><th class="num">更正前余量 (mL)</th><th class="num">更正后余量 (mL)</th></tr></thead><tbody>';
+      for (const c of r.balance_changes) {
+        html += `<tr><td class="mono">${escapeHtml(c.bottle)}</td><td class="num">${c.before}</td><td class="num">${c.after}</td></tr>`;
+      }
+      html += '</tbody></table>';
+    } else {
+      html += '<p class="hint">无瓶余量变化。</p>';
+    }
+    if (r.contribution_changes && r.contribution_changes.length) {
+      html += '<h4>目标瓶及下游瓶的原瓶精确贡献变化（分数 mL）</h4>';
+      for (const cc of r.contribution_changes) html += renderContributionChange(cc);
+    } else {
+      html += '<p class="hint">无原瓶贡献变化。</p>';
+    }
+    html += `<p class="hint">确认凭据已签发（绑定本更正计划与台账版本 ${r.ledger_version}）：` +
+      '点击“确认更正”原子应用，结果与预演一致。</p>';
+  }
+  el.innerHTML = html;
+}
+
+$('corrPreview').addEventListener('click', async () => {
+  clearMsg();
+  const opId = $('corr_op').textContent;
+  $('corrPreview').disabled = true;
+  try {
+    const payload = { sources: readSourceRows($('corrSources')) };
+    const r = await api('/api/operations/' + encodeURIComponent(opId) + '/corrections/preview', 'POST', payload);
+    renderCorrPreview(r);
+    corrPreviewState = r.ok ? { opId, sourcesJson: JSON.stringify(payload.sources), token: r.confirm_token } : null;
+    $('corrConfirm').style.display = r.ok ? '' : 'none';
+  } catch (e) {
+    corrPreviewState = null;
+    $('corrConfirm').style.display = 'none';
+    showMsg('err', e.message, e.details);
+  } finally {
+    $('corrPreview').disabled = false;
+  }
+});
+
+$('corrConfirm').addEventListener('click', async () => {
+  clearMsg();
+  if (!corrPreviewState) { showMsg('err', '请先预演更正'); return; }
+  const sources = readSourceRows($('corrSources'));
+  if (JSON.stringify(sources) !== corrPreviewState.sourcesJson) {
+    showMsg('err', '来源内容在预演后已被修改，请重新预演');
+    $('corrConfirm').style.display = 'none';
+    corrPreviewState = null;
+    return;
+  }
+  $('corrConfirm').disabled = true;
+  try {
+    const r = await api('/api/operations/' + encodeURIComponent(corrPreviewState.opId) + '/corrections/confirm', 'POST', {
+      sources, confirm_token: corrPreviewState.token,
+    });
+    showMsg('ok', r.message + (r.idempotent ? '（幂等）' : ''));
+    corrPreviewState = null;
+    $('corrConfirm').style.display = 'none';
+    $('correctCard').style.display = 'none';
+    loadOps(); loadBottles();
+  } catch (e) {
+    showMsg('err', e.message, e.details);
+    if (e.code === 'STALE_TOKEN' || e.code === 'PLAN_CHANGED' || e.code === 'BAD_TOKEN') {
+      $('corrConfirm').style.display = 'none';
+      corrPreviewState = null;
+    }
+  } finally {
+    $('corrConfirm').disabled = false;
+  }
+});
 
 // ---------- 批次预演 / 提交 ----------
 let lastPreview = null; // { payloadJson, token }：提交内容必须与预演计划一致
