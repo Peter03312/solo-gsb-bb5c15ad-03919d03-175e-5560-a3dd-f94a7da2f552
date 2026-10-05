@@ -1,7 +1,8 @@
 # 水质实验室 · 样本分装与混样溯源工作台
 
 基于 **Node.js + Express + SQLite（better-sqlite3）** 的 Web 工作台，用于管理水质样本的
-原瓶登记、分装 / 混样操作、**批次预演与两阶段提交**、余量守恒校验、完整来源谱系追溯与历史操作更正。
+原瓶登记、分装 / 混样操作、**批次预演与两阶段提交**、余量守恒校验、完整来源谱系追溯、
+**更正预演与凭据确认** 及历史操作更正。
 
 ## 一键启动（Docker Compose）
 
@@ -42,8 +43,10 @@ npm start          # 访问 http://localhost:3000
 - **批量预演 / 提交**：把连续分装 / 混样作为一个批次处理。录入批次号与按录入顺序排列的
   多条操作（每条沿用操作号、目标瓶、操作时间、来源瓶与取用毫升数），先**预演**查看逐条可行性、
   受影响瓶预计余量与提交凭据（不写入数据），再凭凭据**提交**整批；批内可引用前项生成的瓶。
-- **操作记录与更正**：列出全部操作（含所属批次号）；点“更正”可修改该操作的来源与取用量，
-  提交后按操作顺序重算相关瓶余量。
+- **操作记录与更正**：列出全部操作（含所属批次号）；点“更正”可修改该操作的来源与取用量。
+  支持**预演 → 确认**两阶段：先预演查看差异（不写库）——因重放而变化的瓶余量、目标瓶及
+  下游瓶更正前后的原瓶精确贡献（仅列变化项）——再凭确认凭据原子应用，结果与预演一致；
+  也可选择“立即更正”直接提交（沿用原接口，导致后续超用将整体回滚）。
 
 ## 批次处理（本轮新增）
 
@@ -144,6 +147,77 @@ curl -s http://localhost:3000/api/bottles/ALQ-001/contributions
 引用了谱系不完整前项（如前项因来源不存在而不可行）的条目跳过预计贡献，不影响其余条目；
 台账变化导致凭据失效仍按既有 `STALE_TOKEN` / `PLAN_CHANGED` 规则处理。
 
+## 更正预演与确认（本轮新增）
+
+更正历史分装 / 混样操作前，可先**预演**该更正对当前台账的影响，确认无误后再**凭据确认**、
+原子应用；预演不写库，确认结果与预演一致。
+
+1. **预演** `POST /api/operations/:op_id/correct/preview`：提交操作号与拟替换的来源瓶、
+   取用毫升数，**不写入任何数据**。返回：
+   - `balance_changes`：因重放而**变化**的瓶余量（`bottle / before / after`，无变化项不列出）；
+   - `contribution_changes`：**目标瓶及其下游瓶**（形成图中传递依赖目标瓶的衍生瓶）更正前后的
+     原瓶精确贡献对照（`before / after`，沿用约分分数 mL 格式，仅列变化项）；
+   - `correction_token`：确认凭据（HMAC 签名，绑定 更正计划哈希 + 当前台账版本）。
+2. **确认** `POST /api/operations/:op_id/correct/confirm`：携带与预演**完全一致**的
+   `sources` 和 `correction_token`，在**单个事务**中核对凭据、重跑校验与差异计算、
+   替换来源并全账重放复核，原子应用更正。
+
+规则与约定：
+
+- **预演不通过不发凭据**：操作号不存在（404 `OP_NOT_FOUND`）、来源瓶不存在
+  （400 `SOURCE_NOT_FOUND`）、来源重复（400 `DUP_SOURCE`）、体积非正整数（400 `BAD_VOLUME`）、
+  操作时间早于来源创建时间（400 `TIME_BEFORE_SOURCE`）、重放导致任一操作超用
+  （409 `CORRECTION_OVERDRAW`，`details` 逐条给出冲突的 **操作号、瓶、需取量、可用量**）。
+- **确认只接受原预演内容与未变化的台账版本**：内容被改动 → 409 `PLAN_CHANGED`；
+  预演后有新登记 / 操作 / 更正 / 批次提交 → 409 `STALE_TOKEN`；凭据缺失或无效 →
+  400 `TOKEN_REQUIRED` / 409 `BAD_TOKEN`。均需**重新预演**。
+- **凭据幂等**：已确认的同一凭据重试 → 返回**首次结果**（`idempotent: true`），不重复更正；
+  确认记录持久化于 `correction_confirmations` 表。
+- **无变化即空差异**：若更正不改变某瓶余量或某瓶贡献（如等效替换），该项不出现在差异列表中。
+- 现有**立即更正** `POST /api/operations/:op_id/correct` 与**批次预演 / 提交**约定继续可用，
+  互不影响（任何写成功都会使未确认的更正凭据失效）。
+
+### 调用示例
+
+```bash
+# 1) 预演（不写库）：拟把 OP-0001 的来源改为 W2026-001×100 + W2026-003×120
+curl -s http://localhost:3000/api/operations/OP-0001/correct/preview \
+  -H 'Content-Type: application/json' -d '{
+    "sources": [{"bottle":"W2026-001","volume":100},{"bottle":"W2026-003","volume":120}]
+  }'
+# → {"ok":true,"ledger_version":1,
+#    "balance_changes":[{"bottle":"MIX-001","before":250,"after":120},
+#                       {"bottle":"W2026-001","before":800,"after":900}, ...],
+#    "contribution_changes":[
+#      {"bottle":"MIX-001","is_target":true,
+#        "before":{"formation_volume":350,"contributions":[{"bottle":"W2026-001",
+#          "contribution_ml":{"numerator":"200","denominator":"1","text":"200",...}}, ...], ...},
+#        "after":{"formation_volume":220,"contributions":[...], ...}},
+#      {"bottle":"ALQ-001","is_target":false,   ← 下游瓶
+#        "before":{... "text":"400/7" ...}, "after":{... "text":"500/11" ...}}],
+#    "correction_token":"c1.1.<plan_hash>.<hmac>", ...}
+
+# 2) 确认（与预演完全相同的 sources + 凭据，单事务原子应用）
+curl -s http://localhost:3000/api/operations/OP-0001/correct/confirm \
+  -H 'Content-Type: application/json' -d '{
+    "sources": [{"bottle":"W2026-001","volume":100},{"bottle":"W2026-003","volume":120}],
+    "correction_token": "c1.1.<plan_hash>.<hmac>"
+  }'
+# → {"ok":true,"idempotent":false,"balance_changes":[...与预演一致...],
+#    "contribution_changes":[...与预演一致...], ...}
+#    同一凭据重试 → {"ok":true,"idempotent":true, ...首次结果...}，不重复更正
+
+# 3) 预演失败示例：更正导致下游操作超用
+curl -s http://localhost:3000/api/operations/OP-0001/correct/preview \
+  -H 'Content-Type: application/json' -d '{"sources":[{"bottle":"W2026-003","volume":60}]}'
+# → 409 {"error":{"code":"CORRECTION_OVERDRAW","message":"更正将导致以下操作超用…",
+#        "details":[{"op_id":"OP-0002","bottle":"MIX-001","requested":100,"available":60}]}}
+#    （无 correction_token）
+```
+
+确认成功后，相关瓶余量（`GET /api/bottles`）、谱系与原瓶贡献
+（`GET /api/bottles/:id/contributions`）即为更正后状态，与预演差异逐项一致。
+
 ## 业务规则与一致性设计
 
 - **唯一操作号 + 幂等**：`op_id` 为主键。同一操作号重复提交**相同内容**时幂等返回
@@ -154,7 +228,11 @@ curl -s http://localhost:3000/api/bottles/ALQ-001/contributions
   （操作时间, 入库顺序）重放全量台账，任一瓶余量为负即整体回滚，
   返回 409 及冲突明细（操作号、瓶、需取量、可用量）。
 - **历史更正**：更正取用量后按操作顺序重算所有受影响瓶；若导致后续操作超用，
-  **整次更正拒绝并回滚，原数据保持不变**，响应中指出冲突记录。
+  **整次更正拒绝并回滚，原数据保持不变**，响应中指出冲突记录。更正亦可走
+  **预演 → 确认**两阶段：预演在内存中替换来源后模拟重放并对比形成图，返回余量差异、
+  目标瓶及下游瓶的原瓶贡献前后对照与确认凭据（HMAC(更正计划哈希 + 台账版本)，`c1` 前缀，
+  与批次凭据 `v1` 隔离）；确认在单事务中完成 凭据核对 → 校验与差异重算 → 落库 → 全账重放，
+  已确认凭据持久化，重试幂等返回首次结果。
 - **批次两阶段提交**：预演（dry-run）与提交分离。预演在内存中把批次条目追加到当前台账
   末尾模拟重放（虚拟入库顺序与提交时的真实分配一致），返回逐条可行性与预计余量；
   提交凭据 = HMAC(计划哈希 + 台账版本)，台账每次写成功版本递增，凭据随之失效。
@@ -173,7 +251,9 @@ curl -s http://localhost:3000/api/bottles/ALQ-001/contributions
 |---|---|---|
 | `POST` | `/api/bottles` | 登记原始瓶 `{bottle_id, sample_time, initial_volume}` |
 | `POST` | `/api/operations` | 新建操作 `{op_id, target_bottle, op_time, sources:[{bottle, volume}]}` |
-| `POST` | `/api/operations/:op_id/correct` | 更正取用量 `{sources:[{bottle, volume}]}` |
+| `POST` | `/api/operations/:op_id/correct` | 立即更正取用量 `{sources:[{bottle, volume}]}` |
+| `POST` | `/api/operations/:op_id/correct/preview` | **（新增）** 更正预演（不写库）`{sources}` → 余量差异 `balance_changes` + 目标瓶及下游瓶贡献前后对照 `contribution_changes` + `correction_token` |
+| `POST` | `/api/operations/:op_id/correct/confirm` | **（新增）** 更正确认（单事务）`{sources, correction_token}` → 应用成功 / 幂等返回首次结果 / 冲突 409 |
 | `POST` | `/api/batches/preview` | 批次预演（不写库）`{batch_id, items:[{op_id, target_bottle, op_time, sources}]}` → 逐条可行性 + 预计余量 + 可行条目目标瓶的预计原瓶贡献 `projected_contributions` + `commit_token` |
 | `POST` | `/api/batches/commit` | 批次提交（单事务）`{batch_id, items, commit_token}` → 201 / 幂等 200 / 冲突 409 |
 | `GET`  | `/api/batches` | 全部已提交批次 |
@@ -191,6 +271,6 @@ curl -s http://localhost:3000/api/bottles/ALQ-001/contributions
 ├── Dockerfile            # node:20，构建时安装依赖，启动时确保依赖并初始化数据
 ├── docker-compose.yml    # 一键启动，映射 3000 端口，named volume 持久化数据
 ├── package.json
-├── server.js             # Express 服务 + SQLite 台账 + 守恒校验 + 谱系查询 + 批次预演/提交 + 原瓶贡献量（精确分数）
-└── public/index.html     # 单页工作台（总览 / 登记 / 操作 / 批量预演提交 / 记录与更正 / 贡献量展示）
+├── server.js             # Express 服务 + SQLite 台账 + 守恒校验 + 谱系查询 + 批次预演/提交 + 原瓶贡献量（精确分数）+ 更正预演/确认
+└── public/index.html     # 单页工作台（总览 / 登记 / 操作 / 批量预演提交 / 记录与更正（预演差异+凭据确认）/ 贡献量展示）
 ```
